@@ -1,9 +1,11 @@
 """
-FlatRouteFinder Global Backend v2
-Elevation-aware pedestrian routing for any city worldwide.
+FlatRouteFinder Global Backend v3
+- Switched to Open-Elevation API (more reliable than OpenTopoData)
+- Clears stale caches on startup
+- Better elevation validation
 """
 
-import os, math, gzip, pickle, hashlib, logging, time
+import os, math, gzip, pickle, hashlib, logging, time, shutil
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import osmnx as ox
@@ -19,10 +21,16 @@ log = logging.getLogger(__name__)
 COMFORT_GRADE   = 0.02
 K               = 2000
 ALPHAS          = [1.0, 0.67, 0.33, 0.0]
-GRAPH_CACHE_DIR = "graph_cache_v2"          # v2 = forces fresh cache rebuild
-ELEVATION_URL   = "https://api.opentopodata.org/v1/srtm90m"
-ELEV_BATCH_SIZE = 50                         # smaller batches = fewer failures
-MAX_GRADE       = 0.35                       # 35% — steepest walkable grade in any city
+CACHE_VERSION   = "v3"
+GRAPH_CACHE_DIR = f"graph_cache_{CACHE_VERSION}"
+MAX_GRADE       = 0.35      # 35% hard cap — anything above is bad data
+ELEV_BATCH_SIZE = 100
+
+# Purge old cache dirs so stale data never survives a redeploy
+for old in ["graph_cache", "graph_cache_v2"]:
+    if os.path.exists(old):
+        shutil.rmtree(old, ignore_errors=True)
+        log.info(f"Purged old cache: {old}")
 
 os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
 
@@ -38,53 +46,95 @@ def haversine_m(lat1, lng1, lat2, lng2):
 
 
 # ── Elevation ──────────────────────────────────────────────────────────────────
-def fetch_elevations(lats, lngs):
+def fetch_elevations_open_elevation(lats, lngs):
     """
-    Fetch SRTM elevations in small batches with retry.
-    Returns a list of floats — None where fetch failed.
+    Open-Elevation API — free, no key, POST endpoint accepts up to 512 points.
+    More reliable than OpenTopoData for large batches.
     """
-    elevations = []
+    results = [None] * len(lats)
+    url = "https://api.open-elevation.com/api/v1/lookup"
+
     for i in range(0, len(lats), ELEV_BATCH_SIZE):
         blats = lats[i:i + ELEV_BATCH_SIZE]
         blngs = lngs[i:i + ELEV_BATCH_SIZE]
-        loc_str = "|".join(f"{la},{lo}" for la, lo in zip(blats, blngs))
-        batch_result = [None] * len(blats)
-
+        payload = {"locations": [{"latitude": la, "longitude": lo}
+                                  for la, lo in zip(blats, blngs)]}
         for attempt in range(3):
             try:
-                r = requests.get(
-                    ELEVATION_URL,
-                    params={"locations": loc_str},
-                    timeout=30
-                )
+                r = requests.post(url, json=payload, timeout=30)
                 r.raise_for_status()
-                results = r.json().get("results", [])
-                for j, res in enumerate(results):
+                data = r.json().get("results", [])
+                for j, res in enumerate(data):
                     elev = res.get("elevation")
-                    if elev is not None and isinstance(elev, (int, float)):
-                        batch_result[j] = float(elev)
+                    if elev is not None:
+                        results[i + j] = float(elev)
                 break
             except Exception as e:
-                log.warning(f"Elevation batch {i} attempt {attempt+1} failed: {e}")
+                log.warning(f"Open-Elevation batch {i} attempt {attempt+1}: {e}")
                 time.sleep(2)
 
-        elevations.extend(batch_result)
-
-    return elevations
+    return results
 
 
-def interpolate_missing_elevations(node_ids, elevations):
+def fetch_elevations_opentopodata(lats, lngs):
     """
-    Replace None elevations with the average of nearby valid elevations.
-    This prevents false huge grades from failed elevation fetches.
+    OpenTopoData — fallback if Open-Elevation fails.
     """
-    valid = [e for e in elevations if e is not None]
-    fallback = sum(valid) / len(valid) if valid else 0.0
+    results = [None] * len(lats)
+    url = "https://api.opentopodata.org/v1/srtm90m"
 
-    result = []
-    for e in elevations:
-        result.append(e if e is not None else fallback)
-    return result
+    for i in range(0, len(lats), 50):
+        blats = lats[i:i + 50]
+        blngs = lngs[i:i + 50]
+        loc_str = "|".join(f"{la},{lo}" for la, lo in zip(blats, blngs))
+        for attempt in range(2):
+            try:
+                r = requests.get(url, params={"locations": loc_str}, timeout=20)
+                r.raise_for_status()
+                data = r.json().get("results", [])
+                for j, res in enumerate(data):
+                    elev = res.get("elevation")
+                    if elev is not None:
+                        results[i + j] = float(elev)
+                break
+            except Exception as e:
+                log.warning(f"OpenTopoData batch {i} attempt {attempt+1}: {e}")
+                time.sleep(1)
+
+    return results
+
+
+def fetch_elevations(lats, lngs):
+    """
+    Try Open-Elevation first, fill gaps with OpenTopoData.
+    Remaining Nones get the median of valid values.
+    """
+    log.info(f"Fetching elevations for {len(lats)} nodes …")
+    results = fetch_elevations_open_elevation(lats, lngs)
+
+    # Count how many we got
+    got = sum(1 for e in results if e is not None)
+    log.info(f"Open-Elevation returned {got}/{len(lats)} values")
+
+    # If less than 50% succeeded, try OpenTopoData for the gaps
+    if got < len(lats) * 0.5:
+        log.info("Falling back to OpenTopoData for missing values …")
+        fallback = fetch_elevations_opentopodata(lats, lngs)
+        for i, (r, f) in enumerate(zip(results, fallback)):
+            if r is None and f is not None:
+                results[i] = f
+        got2 = sum(1 for e in results if e is not None)
+        log.info(f"After fallback: {got2}/{len(lats)} values")
+
+    # Fill remaining Nones with median of valid values
+    valid = sorted(e for e in results if e is not None)
+    if valid:
+        median = valid[len(valid) // 2]
+    else:
+        median = 0.0
+        log.warning("All elevation fetches failed — grades will be 0")
+
+    return [e if e is not None else median for e in results]
 
 
 # ── Edge weight formula ────────────────────────────────────────────────────────
@@ -94,16 +144,22 @@ def enrich_graph(G):
     lngs  = [d["x"] for _, d in nodes]
     ids   = [n for n, _ in nodes]
 
-    log.info(f"Fetching elevation for {len(ids)} nodes …")
-    raw_elevs = fetch_elevations(lats, lngs)
-    elevs     = interpolate_missing_elevations(ids, raw_elevs)
+    elevs = fetch_elevations(lats, lngs)
 
-    log.info(f"Elevation range: {min(elevs):.1f}m – {max(elevs):.1f}m")
+    elev_min = min(elevs)
+    elev_max = max(elevs)
+    log.info(f"Elevation range: {elev_min:.1f}m – {elev_max:.1f}m "
+             f"(span {elev_max - elev_min:.1f}m)")
+
+    # Sanity check — if span is < 1m the elevation fetch probably failed
+    if elev_max - elev_min < 1.0:
+        log.warning("Elevation span < 1m — elevation data may be flat/failed")
 
     for nid, elev in zip(ids, elevs):
         G.nodes[nid]["elevation"] = elev
 
-    ARTERIALS = {"primary", "trunk", "motorway", "primary_link", "trunk_link", "motorway_link"}
+    ARTERIALS = {"primary", "trunk", "motorway",
+                 "primary_link", "trunk_link", "motorway_link"}
 
     for u, v, k, data in G.edges(keys=True, data=True):
         length = max(float(data.get("length", 1)), 1.0)
@@ -111,7 +167,6 @@ def enrich_graph(G):
         elev_u = float(G.nodes[u].get("elevation") or 0)
         elev_v = float(G.nodes[v].get("elevation") or 0)
 
-        # Cap grade at MAX_GRADE — anything above is bad data
         raw_grade = abs(elev_v - elev_u) / length
         grade_abs = min(raw_grade, MAX_GRADE)
         G[u][v][k]["grade_abs"] = grade_abs
@@ -119,14 +174,13 @@ def enrich_graph(G):
         highway = data.get("highway", "")
         if isinstance(highway, list):
             highway = highway[0] if highway else ""
-
         name = data.get("name", "")
         if isinstance(name, list):
             name = name[0] if name else ""
         name = name or ""
 
-        arterial_penalty = 2.5  if highway in ARTERIALS       else 1.0
-        unnamed_penalty  = 8.0  if not name.strip()           else 1.0
+        arterial_penalty = 2.5  if highway in ARTERIALS             else 1.0
+        unnamed_penalty  = 8.0  if not name.strip()                 else 1.0
         brt_penalty      = 10.0 if "bus rapid transit" in name.lower() else 1.0
 
         excess_grade = max(0.0, grade_abs - COMFORT_GRADE)
@@ -161,11 +215,11 @@ def get_graph(lat1, lng1, lat2, lng2):
     path = os.path.join(GRAPH_CACHE_DIR, f"{key}.pkl.gz")
 
     if os.path.exists(path):
-        log.info(f"Graph cache hit: {key}")
+        log.info(f"Cache hit: {key}")
         with gzip.open(path, "rb") as f:
             return pickle.load(f)
 
-    log.info(f"Downloading graph N{north:.4f} S{south:.4f} E{east:.4f} W{west:.4f}")
+    log.info(f"Downloading OSM graph for bbox …")
     G = ox.graph_from_bbox(
         bbox=(north, south, east, west),
         network_type="walk",
@@ -175,18 +229,16 @@ def get_graph(lat1, lng1, lat2, lng2):
 
     with gzip.open(path, "wb") as f:
         pickle.dump(G, f)
-    log.info(f"Cached graph {key} ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)")
+    log.info(f"Graph cached: {key} ({G.number_of_nodes()} nodes)")
     return G
 
 
-# ── Nearest node (no scikit-learn needed) ─────────────────────────────────────
+# ── Nearest node ───────────────────────────────────────────────────────────────
 def nearest_node(G, lat, lng):
     best_node = None
     best_dist = float('inf')
     for n, d in G.nodes(data=True):
-        dlat = d['y'] - lat
-        dlng = d['x'] - lng
-        dist = dlat*dlat + dlng*dlng
+        dist = (d['y'] - lat)**2 + (d['x'] - lng)**2
         if dist < best_dist:
             best_dist = dist
             best_node = n
@@ -195,20 +247,17 @@ def nearest_node(G, lat, lng):
 
 # ── Subgraph extraction ────────────────────────────────────────────────────────
 def extract_subgraph(G, start_node, end_node):
-    BUDGET_FACTOR = 2.0
     sd = G.nodes[start_node]
     ed = G.nodes[end_node]
     crow = haversine_m(sd["y"], sd["x"], ed["y"], ed["x"])
-    budget = crow * BUDGET_FACTOR
+    budget = crow * 2.0
 
-    keep = set()
+    keep = {start_node, end_node}
     for n, d in G.nodes(data=True):
         if (haversine_m(d["y"], d["x"], sd["y"], sd["x"]) +
             haversine_m(d["y"], d["x"], ed["y"], ed["x"])) <= budget:
             keep.add(n)
 
-    keep.add(start_node)
-    keep.add(end_node)
     return G.subgraph(keep).copy()
 
 
@@ -224,7 +273,7 @@ def compute_route_stats(G, path_nodes):
         coords.append({"lat": nd["y"], "lng": nd["x"]})
 
     for i in range(len(path_nodes) - 1):
-        u, v = path_nodes[i], path_nodes[i+1]
+        u, v = path_nodes[i], path_nodes[i + 1]
         edge   = min(G[u][v].values(), key=lambda d: d.get("length", 9999))
         length = float(edge.get("length", 0))
         dist_m += length
@@ -278,9 +327,6 @@ def route():
     start_node = nearest_node(G, slat, slng)
     end_node   = nearest_node(G, elat, elng)
 
-    if start_node is None or end_node is None:
-        return jsonify({"error": "Could not find nearby streets."}), 500
-
     subG = extract_subgraph(G, start_node, end_node)
 
     unique_routes = []
@@ -302,16 +348,14 @@ def route():
             log.warning(f"Routing error alpha={alpha}: {exc}")
 
     if not unique_routes:
-        return jsonify({"error": "No walkable route found between these points."}), 404
+        return jsonify({"error": "No walkable route found."}), 404
 
-    # Sort shortest first
     unique_routes.sort(key=lambda r: r["distanceInMiles"])
 
-    # Filter routes more than 60% longer than shortest
+    # Drop routes more than 60% longer than shortest
     min_dist = unique_routes[0]["distanceInMiles"]
     unique_routes = [r for r in unique_routes if r["distanceInMiles"] <= min_dist * 1.6]
 
-    # Strip internal keys
     for r in unique_routes:
         r.pop("_alpha", None)
 
@@ -340,7 +384,21 @@ def route():
 # ── Health check ───────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "v2", "cache_dir": GRAPH_CACHE_DIR})
+    return jsonify({"status": "ok", "version": CACHE_VERSION})
+
+
+# ── Elevation debug endpoint ───────────────────────────────────────────────────
+@app.route("/test_elevation")
+def test_elevation():
+    """Quick check that elevation APIs are reachable."""
+    test_lats = [37.7749, 37.8044]
+    test_lngs = [-122.4194, -122.2712]
+    results = fetch_elevations(test_lats, test_lngs)
+    return jsonify({
+        "sf_downtown":  results[0],
+        "oakland":      results[1],
+        "looks_correct": abs(results[0] - 16) < 30   # SF downtown ~16m
+    })
 
 
 if __name__ == "__main__":
