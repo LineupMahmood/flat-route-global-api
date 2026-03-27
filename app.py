@@ -1,16 +1,16 @@
 """
-FlatRouteFinder Global Backend v4
-- Uses srtm.py to download elevation tiles directly (no API key, no rate limits)
-- Grade capped at 35% max
-- Cache version v4 forces fresh rebuild
+FlatRouteFinder Global Backend v5
+- Uses Open-Meteo elevation API (90m SRTM, highly reliable, no key, 100/req)
+- Grade capped at 35%
+- Cache v5 forces fresh rebuild
 """
 
-import os, math, gzip, pickle, hashlib, logging, shutil
+import os, math, gzip, pickle, hashlib, logging, shutil, time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import osmnx as ox
 import networkx as nx
-import srtm
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -21,22 +21,17 @@ log = logging.getLogger(__name__)
 COMFORT_GRADE   = 0.02
 K               = 2000
 ALPHAS          = [1.0, 0.67, 0.33, 0.0]
-CACHE_VERSION   = "v4"
+CACHE_VERSION   = "v5"
 GRAPH_CACHE_DIR = f"graph_cache_{CACHE_VERSION}"
-MAX_GRADE       = 0.35      # 35% hard cap
+MAX_GRADE       = 0.35
+ELEV_BATCH      = 100   # Open-Meteo supports up to 100 per request
 
-# Purge all old cache versions on startup
-for old in ["graph_cache", "graph_cache_v2", "graph_cache_v3"]:
+# Purge old caches
+for old in ["graph_cache", "graph_cache_v2", "graph_cache_v3", "graph_cache_v4"]:
     if os.path.exists(old):
         shutil.rmtree(old, ignore_errors=True)
-        log.info(f"Purged old cache: {old}")
 
 os.makedirs(GRAPH_CACHE_DIR, exist_ok=True)
-
-# Load SRTM elevation data (downloads tiles on first use, caches locally)
-log.info("Loading SRTM elevation data …")
-ELEVATION_DATA = srtm.get_data()
-log.info("SRTM ready")
 
 
 # ── Geometry ───────────────────────────────────────────────────────────────────
@@ -49,47 +44,67 @@ def haversine_m(lat1, lng1, lat2, lng2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# ── Elevation ──────────────────────────────────────────────────────────────────
-def get_elevation(lat, lng):
+# ── Elevation via Open-Meteo ───────────────────────────────────────────────────
+def fetch_elevations(lats, lngs):
     """
-    Get elevation in metres from local SRTM tiles.
-    Returns 0 if data unavailable for this location.
+    Fetch SRTM elevations from Open-Meteo.
+    https://open-meteo.com/en/docs/elevation-api
+    - Free, no API key
+    - Up to 100 locations per request
+    - Returns None for ocean/missing tiles
     """
-    try:
-        elev = ELEVATION_DATA.get_elevation(lat, lng)
-        if elev is None:
-            return 0.0
-        return float(elev)
-    except Exception:
-        return 0.0
+    results = [None] * len(lats)
+    url = "https://api.open-meteo.com/v1/elevation"
+
+    for i in range(0, len(lats), ELEV_BATCH):
+        blats = lats[i:i + ELEV_BATCH]
+        blngs = lngs[i:i + ELEV_BATCH]
+
+        for attempt in range(3):
+            try:
+                r = requests.get(url, params={
+                    "latitude":  ",".join(str(x) for x in blats),
+                    "longitude": ",".join(str(x) for x in blngs),
+                }, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                elevs = data.get("elevation", [])
+                for j, e in enumerate(elevs):
+                    if e is not None:
+                        results[i + j] = float(e)
+                log.info(f"Batch {i}: got {len([x for x in elevs if x is not None])}/{len(blats)}")
+                break
+            except Exception as e:
+                log.warning(f"Open-Meteo batch {i} attempt {attempt+1}: {e}")
+                time.sleep(2)
+
+    # Fill any None with median of valid values
+    valid = sorted(e for e in results if e is not None)
+    fallback = valid[len(valid)//2] if valid else 0.0
+    if not valid:
+        log.warning("All elevation fetches failed — grades will be 0")
+    return [e if e is not None else fallback for e in results]
 
 
 # ── Edge weight formula ────────────────────────────────────────────────────────
 def enrich_graph(G):
-    """
-    Add SRTM elevation to every node, compute grade_abs and impedance
-    on every edge.
-
-    impedance = length × penalties × (1 + K × excess_grade²)
-
-    The quadratic term reflects real human physiology: a 10% hill feels
-    4× harder than a 5% hill. This is the core of the product.
-    """
     nodes = list(G.nodes(data=True))
-    log.info(f"Adding elevation to {len(nodes)} nodes …")
+    lats  = [d["y"] for _, d in nodes]
+    lngs  = [d["x"] for _, d in nodes]
+    ids   = [n for n, _ in nodes]
 
-    elevs = []
-    for nid, data in nodes:
-        elev = get_elevation(data["y"], data["x"])
-        G.nodes[nid]["elevation"] = elev
-        elevs.append(elev)
+    log.info(f"Fetching elevation for {len(ids)} nodes …")
+    elevs = fetch_elevations(lats, lngs)
 
     valid = [e for e in elevs if e != 0.0]
     if valid:
-        log.info(f"Elevation range: {min(valid):.1f}m – {max(valid):.1f}m "
-                 f"(span {max(valid)-min(valid):.1f}m, {len(valid)}/{len(elevs)} valid)")
+        log.info(f"Elevation: min={min(valid):.1f}m max={max(valid):.1f}m "
+                 f"span={max(valid)-min(valid):.1f}m ({len(valid)}/{len(elevs)} non-zero)")
     else:
-        log.warning("All elevations are 0 — SRTM tiles may not cover this area")
+        log.warning("Elevation span is 0 — all values are zero")
+
+    for nid, elev in zip(ids, elevs):
+        G.nodes[nid]["elevation"] = elev
 
     ARTERIALS = {"primary", "trunk", "motorway",
                  "primary_link", "trunk_link", "motorway_link"}
@@ -101,7 +116,7 @@ def enrich_graph(G):
         elev_v = float(G.nodes[v].get("elevation") or 0)
 
         raw_grade = abs(elev_v - elev_u) / length
-        grade_abs = min(raw_grade, MAX_GRADE)   # cap at 35%
+        grade_abs = min(raw_grade, MAX_GRADE)
         G[u][v][k]["grade_abs"] = grade_abs
 
         highway = data.get("highway", "")
@@ -163,7 +178,7 @@ def get_graph(lat1, lng1, lat2, lng2):
 
     with gzip.open(path, "wb") as f:
         pickle.dump(G, f)
-    log.info(f"Cached: {key} ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)")
+    log.info(f"Cached {key} ({G.number_of_nodes()} nodes)")
     return G
 
 
@@ -185,13 +200,11 @@ def extract_subgraph(G, start_node, end_node):
     ed = G.nodes[end_node]
     crow = haversine_m(sd["y"], sd["x"], ed["y"], ed["x"])
     budget = crow * 2.0
-
     keep = {start_node, end_node}
     for n, d in G.nodes(data=True):
         if (haversine_m(d["y"], d["x"], sd["y"], sd["x"]) +
             haversine_m(d["y"], d["x"], ed["y"], ed["x"])) <= budget:
             keep.add(n)
-
     return G.subgraph(keep).copy()
 
 
@@ -217,9 +230,7 @@ def compute_route_stats(G, path_nodes):
         if elev_v > elev_u:
             gain_m += elev_v - elev_u
 
-        # Always re-cap when reading back — defensive against old cached data
-        raw_grade = float(edge.get("grade_abs", 0))
-        grades.append(min(raw_grade, MAX_GRADE))
+        grades.append(min(float(edge.get("grade_abs", 0)), MAX_GRADE))
 
     avg_grade = sum(grades) / len(grades) if grades else 0.0
     max_grade = max(grades)               if grades else 0.0
@@ -262,7 +273,6 @@ def route():
 
     start_node = nearest_node(G, slat, slng)
     end_node   = nearest_node(G, elat, elng)
-
     subG = extract_subgraph(G, start_node, end_node)
 
     unique_routes = []
@@ -279,7 +289,7 @@ def route():
             if not any(routes_are_duplicates(stats, r) for r in unique_routes):
                 unique_routes.append(stats)
         except nx.NetworkXNoPath:
-            log.warning(f"No path for alpha={alpha}")
+            log.warning(f"No path alpha={alpha}")
         except Exception as exc:
             log.warning(f"Routing error alpha={alpha}: {exc}")
 
@@ -287,8 +297,6 @@ def route():
         return jsonify({"error": "No walkable route found."}), 404
 
     unique_routes.sort(key=lambda r: r["distanceInMiles"])
-
-    # Drop routes more than 60% longer than shortest
     min_dist = unique_routes[0]["distanceInMiles"]
     unique_routes = [r for r in unique_routes if r["distanceInMiles"] <= min_dist * 1.6]
 
@@ -328,13 +336,17 @@ def health():
 # ── Elevation test ─────────────────────────────────────────────────────────────
 @app.route("/test_elevation")
 def test_elevation():
-    sf   = get_elevation(37.7749, -122.4194)   # SF downtown ~16m
-    twin = get_elevation(37.7544, -122.4477)   # Twin Peaks  ~280m
+    """Test Open-Meteo directly with two SF points."""
+    elevs = fetch_elevations(
+        [37.7749, 37.7544],   # SF downtown, Twin Peaks
+        [-122.4194, -122.4477]
+    )
+    sf, twin = elevs[0], elevs[1]
     return jsonify({
-        "sf_downtown_m":  sf,
-        "twin_peaks_m":   twin,
+        "sf_downtown_m":  round(sf, 1),
+        "twin_peaks_m":   round(twin, 1),
         "span_m":         round(twin - sf, 1),
-        "looks_correct":  twin > sf + 100      # Twin Peaks should be ~260m higher
+        "looks_correct":  twin > sf + 100
     })
 
 
