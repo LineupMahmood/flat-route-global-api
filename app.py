@@ -86,7 +86,8 @@ def enrich_graph(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
 
         elev_u = float(G.nodes[u].get("elevation") or 0)
         elev_v = float(G.nodes[v].get("elevation") or 0)
-        grade_abs = abs(elev_v - elev_u) / length
+        raw_grade = abs(elev_v - elev_u) / length
+        grade_abs = min(raw_grade, 0.6)  # cap at 60% — steeper = bad data
         G[u][v][k]["grade_abs"] = grade_abs
 
         highway = data.get("highway", "")
