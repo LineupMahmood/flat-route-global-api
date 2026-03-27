@@ -281,7 +281,12 @@ def route():
             stats = compute_route_stats(subG, path)
             stats["_alpha"] = alpha
             if not any(routes_are_duplicates(stats, r) for r in unique_routes):
-                unique_routes.append(stats)
+            unique_routes.append(stats)
+
+    # Remove routes more than 60% longer than the shortest
+    if unique_routes:
+        min_dist = min(r["distanceInMiles"] for r in unique_routes)
+        unique_routes = [r for r in unique_routes if r["distanceInMiles"] <= min_dist * 1.6]
         except nx.NetworkXNoPath:
             log.warning(f"No path found for alpha={alpha}")
         except Exception as exc:
