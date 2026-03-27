@@ -248,8 +248,20 @@ def route():
         return jsonify({"error": f"Could not load map data: {exc}"}), 500
 
     try:
-        start_node = ox.nearest_nodes(G, X=slng, Y=slat)
-        end_node   = ox.nearest_nodes(G, X=elng, Y=elat)
+        def nearest_node(graph, lat, lng):
+            best_node = None
+            best_dist = float('inf')
+            for n, d in graph.nodes(data=True):
+                dlat = d['y'] - lat
+                dlng = d['x'] - lng
+                dist = dlat*dlat + dlng*dlng
+                if dist < best_dist:
+                    best_dist = dist
+                    best_node = n
+            return best_node
+
+        start_node = nearest_node(G, slat, slng)
+        end_node   = nearest_node(G, elat, elng)
     except Exception as exc:
         return jsonify({"error": f"Could not snap to road network: {exc}"}), 500
 
