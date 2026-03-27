@@ -4,5 +4,6 @@ osmnx==1.9.3
 networkx==3.3
 requests==2.32.3
 gunicorn==22.0.0
-shapely==2.0.5
+shapely==2.0.6
+scipy==1.13.1
 numpy==1.26.4
