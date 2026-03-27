@@ -331,3 +331,12 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+# Pre-warm cache on startup — comment this out if you want faster cold starts
+# import threading
+# def prewarm():
+#     try:
+#         get_graph(37.7984, -122.4268, 37.7956, -122.4072)
+#     except:
+#         pass
+# threading.Thread(target=prewarm, daemon=True).start()
